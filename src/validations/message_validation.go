@@ -63,6 +63,19 @@ func ValidateReactMessage(ctx context.Context, request domainMessage.ReactionReq
 	return nil
 }
 
+func ValidateForwardMessage(ctx context.Context, request domainMessage.ForwardRequest) error {
+	err := validation.ValidateStructWithContext(ctx, &request,
+		validation.Field(&request.MessageID, validation.Required),
+		validation.Field(&request.ChatID, validation.Required),
+	)
+
+	if err != nil {
+		return pkgError.ValidationError(err.Error())
+	}
+
+	return nil
+}
+
 func ValidateDeleteMessage(ctx context.Context, request domainMessage.DeleteRequest) error {
 	err := validation.ValidateStructWithContext(ctx, &request,
 		validation.Field(&request.Phone, validation.Required),

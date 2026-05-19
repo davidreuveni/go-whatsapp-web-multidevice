@@ -27,6 +27,12 @@ type UpdateMessageRequest struct {
 	Phone     string `json:"phone" form:"phone"`
 }
 
+type ForwardRequest struct {
+	MessageID   string `json:"message_id" uri:"message_id"`
+	ChatID      string `json:"chat_id" form:"chat_id"`
+	IsForwarded *bool  `json:"is_forwarded,omitempty" form:"is_forwarded"`
+}
+
 type MarkAsReadRequest struct {
 	MessageID string `json:"message_id" uri:"message_id"`
 	Phone     string `json:"phone" form:"phone"`

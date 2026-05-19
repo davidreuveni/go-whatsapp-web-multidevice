@@ -19,6 +19,7 @@ func InitRestMessage(app fiber.Router, service domainMessage.IMessageUsecase) Me
 	app.Post("/message/:message_id/revoke", rest.RevokeMessage)
 	app.Post("/message/:message_id/delete", rest.DeleteMessage)
 	app.Post("/message/:message_id/update", rest.UpdateMessage)
+	app.Post("/message/:message_id/forward", rest.ForwardMessage)
 	app.Post("/message/:message_id/read", rest.MarkAsRead)
 	app.Post("/message/:message_id/star", rest.StarMessage)
 	app.Post("/message/:message_id/unstar", rest.UnstarMessage)
@@ -73,6 +74,25 @@ func (controller *Message) UpdateMessage(c *fiber.Ctx) error {
 	utils.SanitizePhone(&request.Phone)
 
 	response, err := controller.Service.UpdateMessage(whatsapp.ContextWithDevice(c.UserContext(), getDeviceFromCtx(c)), request)
+	utils.PanicIfNeeded(err)
+
+	return c.JSON(utils.ResponseData{
+		Status:  200,
+		Code:    "SUCCESS",
+		Message: response.Status,
+		Results: response,
+	})
+}
+
+func (controller *Message) ForwardMessage(c *fiber.Ctx) error {
+	var request domainMessage.ForwardRequest
+	err := c.BodyParser(&request)
+	utils.PanicIfNeeded(err)
+
+	request.MessageID = c.Params("message_id")
+	utils.SanitizePhone(&request.ChatID)
+
+	response, err := controller.Service.ForwardMessage(whatsapp.ContextWithDevice(c.UserContext(), getDeviceFromCtx(c)), request)
 	utils.PanicIfNeeded(err)
 
 	return c.JSON(utils.ResponseData{

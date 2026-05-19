@@ -1,10 +1,15 @@
 package usecase
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
@@ -14,6 +19,7 @@ import (
 	pkgError "github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/error"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/validations"
+	"github.com/disintegration/imaging"
 	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
@@ -231,6 +237,61 @@ func (service serviceMessage) UpdateMessage(ctx context.Context, request domainM
 	return response, nil
 }
 
+func (service serviceMessage) ForwardMessage(ctx context.Context, request domainMessage.ForwardRequest) (response domainMessage.GenericResponse, err error) {
+	if err = validations.ValidateForwardMessage(ctx, request); err != nil {
+		return response, err
+	}
+
+	client := whatsapp.ClientFromContext(ctx)
+	if client == nil {
+		return response, pkgError.ErrWaCLI
+	}
+
+	dataWaRecipient, err := utils.ValidateJidWithLogin(client, request.ChatID)
+	if err != nil {
+		return response, err
+	}
+
+	storedMessage, err := service.chatStorageRepo.GetMessageByID(request.MessageID)
+	if err != nil {
+		return response, fmt.Errorf("message not found: %v", err)
+	}
+	if storedMessage == nil {
+		return response, fmt.Errorf("message with ID %s not found", request.MessageID)
+	}
+
+	markAsForwarded := true
+	if request.IsForwarded != nil {
+		markAsForwarded = *request.IsForwarded
+	}
+
+	thumbnail := generateForwardPreviewThumbnail(ctx, client, storedMessage)
+	msg, content, err := buildForwardMessageProto(storedMessage, markAsForwarded, thumbnail)
+	if err != nil {
+		return response, err
+	}
+
+	ts, err := sendForwardMessageWithRetry(ctx, client, dataWaRecipient, msg)
+	if err != nil {
+		return response, fmt.Errorf("failed to forward message %s to %s (media_type=%s has_preview=%t): %w", request.MessageID, request.ChatID, storedMessage.MediaType, len(thumbnail) > 0, err)
+	}
+
+	go service.storeForwardedMessage(ctx, client, dataWaRecipient, ts.ID, content, ts.Timestamp, msg)
+
+	logrus.Info(map[string]any{
+		"source_message_id": request.MessageID,
+		"message_id":        ts.ID,
+		"chat":              dataWaRecipient.String(),
+		"media_type":        storedMessage.MediaType,
+		"is_forwarded":      markAsForwarded,
+		"has_preview":       len(thumbnail) > 0,
+	})
+
+	response.MessageID = ts.ID
+	response.Status = fmt.Sprintf("Message forwarded to %s (server timestamp: %s)", request.ChatID, ts.Timestamp)
+	return response, nil
+}
+
 // StarMessage implements message.IMessageService.
 func (service serviceMessage) StarMessage(ctx context.Context, request domainMessage.StarRequest) (err error) {
 	if err = validations.ValidateStarMessage(ctx, request); err != nil {
@@ -386,4 +447,297 @@ func (service serviceMessage) DownloadMedia(ctx context.Context, request domainM
 	})
 
 	return response, nil
+}
+
+func buildForwardMessageProto(message *domainChatStorage.Message, markAsForwarded bool, thumbnail []byte) (*waE2E.Message, string, error) {
+	if message == nil {
+		return nil, "", fmt.Errorf("message not found")
+	}
+
+	contextInfo := forwardedContextInfo(markAsForwarded)
+
+	switch message.MediaType {
+	case "":
+		if message.Content == "" {
+			return nil, "", fmt.Errorf("message %s has no forwardable content", message.ID)
+		}
+		return &waE2E.Message{
+			ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+				Text:        proto.String(message.Content),
+				ContextInfo: contextInfo,
+			},
+		}, message.Content, nil
+	case "image":
+		if err := validateForwardableMedia(message); err != nil {
+			return nil, "", err
+		}
+		return &waE2E.Message{
+			ImageMessage: &waE2E.ImageMessage{
+				Caption:       proto.String(message.Content),
+				URL:           proto.String(message.URL),
+				Mimetype:      proto.String("image/jpeg"),
+				MediaKey:      message.MediaKey,
+				FileSHA256:    message.FileSHA256,
+				FileEncSHA256: message.FileEncSHA256,
+				FileLength:    proto.Uint64(message.FileLength),
+				JPEGThumbnail: thumbnail,
+				ContextInfo:   contextInfo,
+			},
+		}, message.Content, nil
+	case "video", "video_note":
+		if err := validateForwardableMedia(message); err != nil {
+			return nil, "", err
+		}
+		caption := forwardVideoCaption(message)
+		return &waE2E.Message{
+			VideoMessage: &waE2E.VideoMessage{
+				Caption:       proto.String(caption),
+				URL:           proto.String(message.URL),
+				Mimetype:      proto.String("video/mp4"),
+				MediaKey:      message.MediaKey,
+				FileSHA256:    message.FileSHA256,
+				FileEncSHA256: message.FileEncSHA256,
+				FileLength:    proto.Uint64(message.FileLength),
+				JPEGThumbnail: thumbnail,
+				ContextInfo:   contextInfo,
+			},
+		}, caption, nil
+	case "audio":
+		if err := validateForwardableMedia(message); err != nil {
+			return nil, "", err
+		}
+		return &waE2E.Message{
+			AudioMessage: &waE2E.AudioMessage{
+				URL:           proto.String(message.URL),
+				Mimetype:      proto.String("audio/ogg; codecs=opus"),
+				MediaKey:      message.MediaKey,
+				FileSHA256:    message.FileSHA256,
+				FileEncSHA256: message.FileEncSHA256,
+				FileLength:    proto.Uint64(message.FileLength),
+				ContextInfo:   contextInfo,
+			},
+		}, message.Content, nil
+	case "document":
+		if err := validateForwardableMedia(message); err != nil {
+			return nil, "", err
+		}
+		return &waE2E.Message{
+			DocumentMessage: &waE2E.DocumentMessage{
+				Caption:       proto.String(message.Content),
+				URL:           proto.String(message.URL),
+				Mimetype:      proto.String("application/octet-stream"),
+				FileName:      proto.String(message.Filename),
+				MediaKey:      message.MediaKey,
+				FileSHA256:    message.FileSHA256,
+				FileEncSHA256: message.FileEncSHA256,
+				FileLength:    proto.Uint64(message.FileLength),
+				ContextInfo:   contextInfo,
+			},
+		}, message.Content, nil
+	case "sticker":
+		if err := validateForwardableMedia(message); err != nil {
+			return nil, "", err
+		}
+		return &waE2E.Message{
+			StickerMessage: &waE2E.StickerMessage{
+				URL:           proto.String(message.URL),
+				Mimetype:      proto.String("image/webp"),
+				MediaKey:      message.MediaKey,
+				FileSHA256:    message.FileSHA256,
+				FileEncSHA256: message.FileEncSHA256,
+				FileLength:    proto.Uint64(message.FileLength),
+				ContextInfo:   contextInfo,
+			},
+		}, message.Content, nil
+	default:
+		return nil, "", fmt.Errorf("unsupported media type for forwarding: %s", message.MediaType)
+	}
+}
+
+func forwardedContextInfo(markAsForwarded bool) *waE2E.ContextInfo {
+	if !markAsForwarded {
+		return nil
+	}
+
+	return &waE2E.ContextInfo{
+		IsForwarded:     proto.Bool(true),
+		ForwardingScore: proto.Uint32(100),
+	}
+}
+
+func forwardVideoCaption(message *domainChatStorage.Message) string {
+	if message == nil {
+		return ""
+	}
+
+	caption := message.Content
+	if !message.IsFromMe {
+		return caption
+	}
+	if caption == "🎥 Video" {
+		return ""
+	}
+	return strings.TrimPrefix(caption, "🎥 ")
+}
+
+func generateForwardPreviewThumbnail(ctx context.Context, client *whatsmeow.Client, message *domainChatStorage.Message) []byte {
+	if client == nil || message == nil {
+		return nil
+	}
+
+	switch message.MediaType {
+	case "image":
+		downloadable := &waE2E.ImageMessage{
+			URL:           proto.String(message.URL),
+			Mimetype:      proto.String("image/jpeg"),
+			MediaKey:      message.MediaKey,
+			FileSHA256:    message.FileSHA256,
+			FileEncSHA256: message.FileEncSHA256,
+			FileLength:    proto.Uint64(message.FileLength),
+		}
+		data, err := client.Download(ctx, downloadable)
+		if err != nil {
+			logrus.Warnf("Failed to download image %s for forward preview: %v", message.ID, err)
+			return nil
+		}
+		thumbnail, err := imageBytesToJPEGThumbnail(data)
+		if err != nil {
+			logrus.Warnf("Failed to generate image preview for forwarded message %s: %v", message.ID, err)
+			return nil
+		}
+		return thumbnail
+	case "video", "video_note":
+		downloadable := &waE2E.VideoMessage{
+			URL:           proto.String(message.URL),
+			Mimetype:      proto.String("video/mp4"),
+			MediaKey:      message.MediaKey,
+			FileSHA256:    message.FileSHA256,
+			FileEncSHA256: message.FileEncSHA256,
+			FileLength:    proto.Uint64(message.FileLength),
+		}
+		data, err := client.Download(ctx, downloadable)
+		if err != nil {
+			logrus.Warnf("Failed to download video %s for forward preview: %v", message.ID, err)
+			return nil
+		}
+		thumbnail, err := videoBytesToJPEGThumbnail(ctx, data)
+		if err != nil {
+			logrus.Warnf("Failed to generate video preview for forwarded message %s: %v", message.ID, err)
+			return nil
+		}
+		return thumbnail
+	default:
+		return nil
+	}
+}
+
+func imageBytesToJPEGThumbnail(data []byte) ([]byte, error) {
+	srcImage, err := imaging.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	return encodeForwardThumbnail(srcImage)
+}
+
+func videoBytesToJPEGThumbnail(ctx context.Context, data []byte) ([]byte, error) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return nil, fmt.Errorf("ffmpeg not installed: %w", err)
+	}
+	if err := os.MkdirAll(config.PathSendItems, 0755); err != nil {
+		return nil, err
+	}
+
+	inputFile, err := os.CreateTemp(config.PathSendItems, "forward-preview-*.mp4")
+	if err != nil {
+		return nil, err
+	}
+	inputPath := inputFile.Name()
+	defer os.Remove(inputPath)
+	if _, err := inputFile.Write(data); err != nil {
+		inputFile.Close()
+		return nil, err
+	}
+	if err := inputFile.Close(); err != nil {
+		return nil, err
+	}
+
+	outputFile, err := os.CreateTemp(config.PathSendItems, "forward-preview-*.jpg")
+	if err != nil {
+		return nil, err
+	}
+	outputPath := outputFile.Name()
+	outputFile.Close()
+	defer os.Remove(outputPath)
+
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "00:00:01.000", "-i", inputPath, "-frames:v", "1", outputPath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("ffmpeg thumbnail failed: %w: %s", err, string(output))
+	}
+
+	srcImage, err := imaging.Open(outputPath)
+	if err != nil {
+		return nil, err
+	}
+	return encodeForwardThumbnail(srcImage)
+}
+
+func encodeForwardThumbnail(srcImage image.Image) ([]byte, error) {
+	resizedImage := imaging.Resize(srcImage, 100, 0, imaging.Lanczos)
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, resizedImage, &jpeg.Options{Quality: 80}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func sendForwardMessageWithRetry(ctx context.Context, client *whatsmeow.Client, recipient types.JID, msg *waE2E.Message) (whatsmeow.SendResponse, error) {
+	response, err := client.SendMessage(ctx, recipient, msg)
+	if err == nil {
+		return response, nil
+	}
+	if !strings.Contains(err.Error(), "server returned error 479") {
+		return response, err
+	}
+
+	logrus.Warnf("Forward send got WhatsApp server error 479; retrying once | chat=%s", recipient.String())
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return response, err
+	case <-timer.C:
+	}
+
+	retryResponse, retryErr := client.SendMessage(ctx, recipient, msg)
+	if retryErr != nil {
+		return retryResponse, fmt.Errorf("%w (first attempt: %v)", retryErr, err)
+	}
+	return retryResponse, nil
+}
+
+func validateForwardableMedia(message *domainChatStorage.Message) error {
+	if message.URL == "" || len(message.MediaKey) == 0 || len(message.FileSHA256) == 0 || len(message.FileEncSHA256) == 0 {
+		return fmt.Errorf("message %s is missing stored media data and cannot be forwarded", message.ID)
+	}
+	return nil
+}
+
+func (service serviceMessage) storeForwardedMessage(ctx context.Context, client *whatsmeow.Client, recipient types.JID, messageID string, content string, timestamp time.Time, msg *waE2E.Message) {
+	storeBaseCtx := context.Background()
+	if device, ok := whatsapp.DeviceFromContext(ctx); ok {
+		storeBaseCtx = whatsapp.ContextWithDevice(storeBaseCtx, device)
+	}
+
+	storeCtx, cancel := context.WithTimeout(storeBaseCtx, 2*time.Second)
+	defer cancel()
+
+	senderJID := ""
+	if client.Store.ID != nil {
+		senderJID = client.Store.ID.String()
+	}
+
+	if err := service.chatStorageRepo.StoreSentMessageWithContext(storeCtx, messageID, senderJID, recipient.String(), content, timestamp, msg); err != nil {
+		logrus.Warnf("Failed to store forwarded message: %v", err)
+	}
 }

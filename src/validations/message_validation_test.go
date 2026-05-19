@@ -290,3 +290,47 @@ func TestValidateStarMessage(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateForwardMessage(t *testing.T) {
+	tests := []struct {
+		name string
+		req  domainMessage.ForwardRequest
+		want []string
+	}{
+		{
+			name: "valid",
+			req: domainMessage.ForwardRequest{
+				MessageID: "3EB0789ABC123456",
+				ChatID:    "6281234567890@s.whatsapp.net",
+			},
+		},
+		{
+			name: "missing message id",
+			req: domainMessage.ForwardRequest{
+				ChatID: "6281234567890@s.whatsapp.net",
+			},
+			want: []string{"message_id: cannot be blank"},
+		},
+		{
+			name: "missing chat id",
+			req: domainMessage.ForwardRequest{
+				MessageID: "3EB0789ABC123456",
+			},
+			want: []string{"chat_id: cannot be blank"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateForwardMessage(context.Background(), tt.req)
+			if len(tt.want) == 0 {
+				assert.NoError(t, err)
+				return
+			}
+			assert.Error(t, err)
+			for _, msg := range tt.want {
+				assert.ErrorContains(t, err, msg)
+			}
+		})
+	}
+}
